@@ -616,7 +616,18 @@ void loop() {
     if (millis() - lastActivityTime >= HalPowerManager::IDLE_POWER_SAVING_MS) {
       // If we've been inactive for a while, increase the delay to save power
       powerManager.setPowerSaving(true);  // Lower CPU frequency after extended inactivity
+#if FREEINK_DEVICE_LILYGO_EPD47
+      // Light-sleep the idle wait instead of spinning at 10 MHz — drops the
+      // reading floor from ~40 mA to ~25 mA. The 50 ms slice matches the old
+      // poll cadence so GT911 gesture recognition still gets enough samples per
+      // contact (a swipe is a <=700 ms / >=60 px flick reconstructed from
+      // repeated polls — sleeping longer starves the sample stream and
+      // misclassifies swipes as taps). Skipped on USB (USJ + light sleep
+      // hard-hangs) — see HalPowerManager::idleLightSleep.
+      powerManager.idleLightSleep(50, gpio.isUsbConnected());
+#else
       delay(50);
+#endif
     } else {
       // Short delay to prevent tight loop while still being responsive
       delay(10);

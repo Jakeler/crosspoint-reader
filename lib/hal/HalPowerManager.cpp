@@ -15,6 +15,73 @@
 
 HalPowerManager powerManager;  // Singleton instance
 
+#if FREEINK_DEVICE_LILYGO_EPD47
+namespace {
+// EPD pads that must not glitch while the CPU is in light sleep. Pin map from
+// the vendor driver (LilyGo-EPD47 ed047tc1.h, ESP32-S3 section).
+//
+// The panel corruption we're guarding against (v1 sweeping bars) comes from the
+// 4094 config register: LE/STV/OE and the pos/neg waveform rails are its OUTPUT
+// bits, and a stray CFG_STR (GPIO0) strobe latches whatever is in the shift
+// register onto them, driving the powered-off panel. CFG_STR is the ONLY pin
+// that latches — CFG_CLK/CFG_DATA merely shift bits in and cannot reach the
+// outputs without an STR edge — so holding CFG_STR alone prevents the artifact.
+//
+// CFG_CLK (GPIO12) and CFG_DATA (GPIO13) are DELIBERATELY NOT held: on this
+// board they are shared with the SD SPI bus (GPIO12 = SD CS, GPIO13 = SD MOSI;
+// see BoardConfig LilyGo "SCLK14 MISO21 MOSI13 CS12"). Freezing them across a
+// light sleep corrupts any SD transaction that follows — which is why the
+// SD-heavy home menu (cover loading) rebooted while the reader, which barely
+// touches SD, did not. CKV/STH/CKH and the data bus (none SD-shared) are held
+// so the panel sees no clock edges.
+constexpr gpio_num_t EPD_LIGHT_SLEEP_HOLD_PADS[] = {
+    GPIO_NUM_0,                                       // CFG_STR (4094 strobe; the only latch pin — must be held)
+    GPIO_NUM_38,                                      // CKV
+    GPIO_NUM_40,                                      // STH
+    GPIO_NUM_41,                                      // CKH
+    GPIO_NUM_8,  GPIO_NUM_1, GPIO_NUM_2, GPIO_NUM_3,  // D0..D3
+    GPIO_NUM_4,  GPIO_NUM_5, GPIO_NUM_6, GPIO_NUM_7,  // D4..D7
+};
+}  // namespace
+
+void HalPowerManager::idleLightSleep(uint32_t maxSleepMs, bool usbConnected) const {
+  // Skip when a background task holds the full-speed lock (it may be mid
+  // SD/SPI transfer — light sleep gates the SPI clock mid-transaction), while
+  // WiFi is up (light sleep drops the association), or while a USB host is
+  // attached: entering light sleep with the USB-Serial-JTAG console active
+  // wedges the chip (bench-verified — hard hang until watchdog reset; this is
+  // why the IDF PM governor holds a USJ lock). On USB the loop just idles at
+  // normal clock (DFS is disabled on this board — see setPowerSaving). Relaxed
+  // read of currentLockMode, same as setPowerSaving(). Fallback delay stays
+  // short to keep polling responsive.
+  if (currentLockMode != None || WiFi.getMode() != WIFI_MODE_NULL || usbConnected) {
+    delay(50);
+    return;
+  }
+  // Timer-only wake (maxSleepMs). Kept short (50 ms) so the loop resumes GT911
+  // polling fast enough to reconstruct touch gestures — a longer sleep starves
+  // the sample stream and misclassifies swipes as taps. No GPIO wake is armed:
+  // at a 50 ms cadence button/touch latency is already imperceptible, and it
+  // keeps any wake source from leaking into esp_deep_sleep_start() (the
+  // instant-wake boot-loop pitfall noted in begin()).
+  // Freeze every EPD pad through the sleep. gpio_hold_en is per-pin and works
+  // in light sleep — unlike the deep-sleep-wide gpio_deep_sleep_hold_en, so
+  // the panel back-powering hazard documented in startDeepSleep() does not
+  // apply; the pads resume their (unchanged) driven levels after release.
+  for (const gpio_num_t p : EPD_LIGHT_SLEEP_HOLD_PADS) {
+    gpio_hold_en(p);
+  }
+  // esp_light_sleep_start() advances the FreeRTOS tick across the sleep, so
+  // millis() and the auto-sleep timer stay consistent.
+  esp_sleep_enable_timer_wakeup(static_cast<uint64_t>(maxSleepMs) * 1000ULL);
+  esp_light_sleep_start();
+  esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_TIMER);
+  for (const gpio_num_t p : EPD_LIGHT_SLEEP_HOLD_PADS) {
+    gpio_hold_dis(p);
+  }
+}
+#endif
+
 void HalPowerManager::releaseSleepHolds() {
 #if FREEINK_DEVICE_LILYGO_EPD47
   // This firmware no longer engages gpio holds for sleep (bench-measured as
@@ -24,6 +91,12 @@ void HalPowerManager::releaseSleepHolds() {
   // in setup(): a still-held-LOW GT911 INT pad swallows the touch wake pulse.
   gpio_deep_sleep_hold_dis();
   for (const gpio_num_t p : {GPIO_NUM_11, GPIO_NUM_12, GPIO_NUM_13, GPIO_NUM_15, GPIO_NUM_42, GPIO_NUM_47}) {
+    gpio_hold_dis(p);
+  }
+  // Also release the idle-light-sleep pad holds: if the firmware resets while
+  // idleLightSleep() has them engaged, holds on RTC-capable pads (0-21) can
+  // survive the reset and would fight the EPD driver's bring-up.
+  for (const gpio_num_t p : EPD_LIGHT_SLEEP_HOLD_PADS) {
     gpio_hold_dis(p);
   }
 #endif
@@ -57,6 +130,18 @@ void HalPowerManager::begin() {
 }
 
 void HalPowerManager::setPowerSaving(bool enabled) {
+#if FREEINK_DEVICE_LILYGO_EPD47
+  // DFS (setCpuFrequencyMhz) is DISABLED on this S3 board. Switching the CPU —
+  // and with it the APB clock — while the vendor EPD driver's I2S(LCD)/RMT(CKV)
+  // peripherals are live (they clock off APB and are never deinited) wedges the
+  // chip: the TG1 interrupt watchdog resets it right after "Going to low-power
+  // mode" (rst 0x8 TG1WDT_SYS_RST), boot-looping in the home menu. The reader
+  // survived only because its EPD peripheral idles on a static page. Idle power
+  // is handled by light sleep instead (idleLightSleep halts the core without
+  // touching the APB divider). Leave the CPU at its normal frequency.
+  (void)enabled;
+  return;
+#else
   if (normalFreq <= 0) {
     return;  // invalid state
   }
@@ -89,6 +174,7 @@ void HalPowerManager::setPowerSaving(bool enabled) {
   }
 
   // Otherwise, no change needed
+#endif
 }
 
 void HalPowerManager::startDeepSleep(HalGPIO& gpio) const {

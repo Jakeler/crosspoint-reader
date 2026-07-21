@@ -28,7 +28,9 @@ class HalPowerManager {
   SemaphoreHandle_t modeMutex = nullptr;  // Protect access to currentLockMode
 
  public:
-  static constexpr int LOW_POWER_FREQ = 10;  // MHz
+  static constexpr int LOW_POWER_FREQ = 10;  // MHz (Xteink C3 only; DFS is
+                                             // disabled on the LilyGo S3 — see
+                                             // setPowerSaving)
   // How long to hold full CPU speed after the last user activity before clamping
   // to LOW_POWER_FREQ. The page render runs synchronously in activityManager.loop()
   // at full speed and the next input edge restores it before the next render, so
@@ -54,6 +56,21 @@ class HalPowerManager {
 
   // Control CPU frequency for power saving
   void setPowerSaving(bool enabled);
+
+#if FREEINK_DEVICE_LILYGO_EPD47
+  // Light-sleep the reading-idle wait (timer wake) instead of spinning at the
+  // low-power clock: halts the CPU for up to maxSleepMs (RAM + peripheral init
+  // retained), dropping the reading floor from ~40 mA to ~25 mA. Keep maxSleepMs
+  // short (50 ms) — the loop resumes GT911 polling on wake, and a longer sleep
+  // starves the gesture sample stream (a swipe is a <=700 ms flick rebuilt from
+  // repeated polls) so swipes misclassify as taps. The EPD control pads are
+  // gpio_hold'ed across the sleep; without that (v1 of this prototype) pad
+  // glitches at sleep entry/exit clocked garbage into the panel's 4094 config
+  // register and drove sweeping black/white bars onto the powered-off panel.
+  // Pass usbConnected (gpio.isUsbConnected()) — light sleep with the
+  // USB-Serial-JTAG console attached hard-hangs the chip, so it is skipped.
+  void idleLightSleep(uint32_t maxSleepMs, bool usbConnected) const;
+#endif
 
   // Setup wake up GPIO and enter deep sleep
   // Should be called inside main loop() to handle the currentLockMode
